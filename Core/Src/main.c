@@ -27,6 +27,7 @@
 #include "DHT.h"
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
+#include "scheduler.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,7 +51,7 @@ SPI_HandleTypeDef hspi1;
 TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
-#define MAX_TEMP_HUM_SAMPLES 60  // Зберігати останні 60 вимірювань (1 година)
+#define MAX_SAMPLES 60  // Зберігати останні 60 вимірювань (1 година)
 
 typedef enum {
   DISP_TEMP,
@@ -59,15 +60,14 @@ typedef enum {
   DISP_HUM_AVG,
 } DisplayMode_t;
 
-uint8_t temp_hum_buffer[MAX_TEMP_HUM_SAMPLES][2];  // Буфер для зберігання температури та вологості
+float temp_buffer[MAX_SAMPLES];  // Буфер для зберігання температури
+float hum_buffer[MAX_SAMPLES]; // Буфер для зберігання вологості
 uint8_t buffer_index = 0;
-float avg_temp = 0, avg_hum = 0;  // Середні значення за останню годину
+
 DisplayMode_t display_mode = DISP_TEMP;
 
 DHT_sensor dth22;
-DHT_data dth22Data;
-
-//static DHT_sensor livingRoom = { GPIOA, GPIO_PIN_3, DHT22, GPIO_NOPULL };
+uint8_t isPrepared = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,7 +76,12 @@ static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-
+void StartTaskByMode(void);
+void MeasureTask(void);
+void DisplayTempTask(void);
+void DisplayHumTask(void);
+void DisplayTempAvgTask(void);
+void DisplayHumAvgTask(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -84,22 +89,35 @@ static void MX_TIM3_Init(void);
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 	if (htim->Instance == TIM3) {
-		temp_hum_buffer[buffer_index][0] = (uint8_t) dth22Data.temp;
-		temp_hum_buffer[buffer_index][1] = (uint8_t) dth22Data.hum;
-		buffer_index = (buffer_index + 1) % MAX_TEMP_HUM_SAMPLES;
+		 SetTask(MeasureTask);
 	}
 }
 
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-   if(GPIO_Pin == KEY_Pin)
-   {
-      display_mode = (DisplayMode_t)((display_mode + 1) % 4);
-   }
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	if (GPIO_Pin == KEY_Pin) {
+		display_mode = (DisplayMode_t)((display_mode + 1) % 4);
+		StartTaskByMode();
+	}
 }
 
-void UpdateDisplay(char* name, char* value)
-{
+void StartTaskByMode(void) {
+	switch (display_mode) {
+	case DISP_TEMP:
+		SetTask(DisplayTempTask);
+		break;
+	case DISP_HUM:
+		SetTask(DisplayHumTask);
+		break;
+	case DISP_TEMP_AVG:
+		SetTask(DisplayTempAvgTask);
+		break;
+	case DISP_HUM_AVG:
+		SetTask(DisplayHumAvgTask);
+		break;
+	}
+}
+
+void UpdateDisplay(char* name, char* value) {
 	ssd1306_Fill(White);
 	ssd1306_SetCursor(2, 10);
 	ssd1306_WriteString(name, Font_11x18, Black);
@@ -108,73 +126,62 @@ void UpdateDisplay(char* name, char* value)
 	ssd1306_UpdateScreen();
 }
 
-void DisplayTemp(void)
-{
+float CalculateAverage(float* values, uint8_t size) {
+	float sum = 0;
+	for (uint8_t i = 0; i < size; i++) {
+		sum += values[i];
+	}
+	return sum / size;
+}
+
+float CalculateMaxDeviation(float* values, uint8_t size, float average) {
+	float maxDeviation = 0;
+	for (uint8_t i = 0; i < size; i++) {
+		float deviation = fabs(values[i] - average);
+		if (deviation > maxDeviation) {
+			maxDeviation = deviation;
+		}
+	}
+	return maxDeviation;
+}
+
+void MeasureTask(void) {
+	DHT_data dth22Data = DHT_getData(&dth22);
+	temp_buffer[buffer_index] = dth22Data.temp;
+	hum_buffer[buffer_index] = dth22Data.hum;
+	buffer_index = (buffer_index + 1) % MAX_SAMPLES;
+	StartTaskByMode();
+}
+
+void DisplayTempTask(void) {
 	char msgTemp[20];
-	sprintf(msgTemp, "%d'C", (uint8_t) dth22Data.temp);
+	float current_temp = temp_buffer[buffer_index -1];
+	sprintf(msgTemp, "%d'C", (uint8_t) current_temp);
 	UpdateDisplay("TEMP", &msgTemp);
 }
 
 
-void DisplayHum(void)
-{
+void DisplayHumTask(void) {
 	char msgHum[20];
-	sprintf(msgHum, "%d%%", (uint8_t) dth22Data.hum);
+	float current_hum = hum_buffer[buffer_index - 1];
+	sprintf(msgHum, "%d%%", (uint8_t) current_hum);
 	UpdateDisplay("HUM", &msgHum);
 }
 
-void DisplayTempAvg(void)
-{
-	avg_temp = 0;
-
-	for (uint8_t i = 0; i < MAX_TEMP_HUM_SAMPLES; i++) {
-		avg_temp += temp_hum_buffer[i][0];
-	}
-	avg_temp /= MAX_TEMP_HUM_SAMPLES;
-
-	char max_deviation[20];
-	float temp_deviation = 0.0;
-	for (uint8_t i = 0; i < MAX_TEMP_HUM_SAMPLES; i++) {
-		temp_deviation = fabs(temp_hum_buffer[i][0] - avg_temp);
-	}
-	sprintf(max_deviation, "%d'C", (uint8_t) temp_deviation);
-	UpdateDisplay("TEMP AVG", &max_deviation);
+void DisplayTempAvgTask(void) {
+	float temp_average = CalculateAverage(hum_buffer, MAX_SAMPLES);
+	float temp_deviation = CalculateMaxDeviation(hum_buffer, MAX_SAMPLES, temp_average);
+	char msg_max_deviation[20];
+	sprintf(msg_max_deviation, "%d'C", (uint8_t) temp_deviation);
+	UpdateDisplay("TEMP AVG", &msg_max_deviation);
 }
 
-void DisplayHumAvg(void)
-{
-	avg_hum = 0;
-
-	for (uint8_t i = 0; i < MAX_TEMP_HUM_SAMPLES; i++) {
-		avg_hum += temp_hum_buffer[i][1];
-	}
-	avg_hum /= MAX_TEMP_HUM_SAMPLES;
-
-	char max_deviation[20];
-	float hum_deviation = 0.0;
-	for (uint8_t i = 0; i < MAX_TEMP_HUM_SAMPLES; i++) {
-		hum_deviation = fabs(temp_hum_buffer[i][0] - avg_hum);
-	}
-	sprintf(max_deviation, "%d%%", (uint8_t) hum_deviation);
-	UpdateDisplay("HUM AVG", &max_deviation);
-}
-
-void TaskTemperatureHumidity(void)
-{
-	switch (display_mode) {
-	case DISP_TEMP:
-		DisplayTemp();
-		break;
-	case DISP_HUM:
-		DisplayHum();
-		break;
-	case DISP_TEMP_AVG:
-		DisplayTempAvg();
-		break;
-	case DISP_HUM_AVG:
-		DisplayHumAvg();
-		break;
-	}
+void DisplayHumAvgTask(void) {
+	float hum_average = CalculateAverage(hum_buffer, MAX_SAMPLES);
+	float hum_deviation = CalculateMaxDeviation(hum_buffer, MAX_SAMPLES, hum_average);
+	char msg_max_deviation[20];
+	sprintf(msg_max_deviation, "%d%%", (uint8_t) hum_deviation);
+	UpdateDisplay("HUM AVG", &msg_max_deviation);
 }
 /* USER CODE END 0 */
 
@@ -182,54 +189,58 @@ void TaskTemperatureHumidity(void)
   * @brief  The application entry point.
   * @retval int
   */
-int main(void)
-{
+int main(void) {
+	/* USER CODE BEGIN 1 */
 
-  /* USER CODE BEGIN 1 */
+	/* USER CODE END 1 */
 
-  /* USER CODE END 1 */
+	/* MCU Configuration--------------------------------------------------------*/
 
-  /* MCU Configuration--------------------------------------------------------*/
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+	/* USER CODE BEGIN Init */
 
-  /* USER CODE BEGIN Init */
+	/* USER CODE END Init */
 
-  /* USER CODE END Init */
+	/* Configure the system clock */
+	SystemClock_Config();
 
-  /* Configure the system clock */
-  SystemClock_Config();
+	/* USER CODE BEGIN SysInit */
 
-  /* USER CODE BEGIN SysInit */
+	/* USER CODE END SysInit */
 
-  /* USER CODE END SysInit */
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_SPI1_Init();
+	MX_TIM3_Init();
+	/* USER CODE BEGIN 2 */
+	ssd1306_Init();
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_SPI1_Init();
-  MX_TIM3_Init();
-  /* USER CODE BEGIN 2 */
-  ssd1306_Init();
+	dth22.DHT_Port = GPIOA;
+	dth22.DHT_Pin = GPIO_PIN_3;
+	dth22.type = DHT22;
+	dth22.pullUp = GPIO_NOPULL;
 
-  dth22.DHT_Port = GPIOA;
-  dth22.DHT_Pin = GPIO_PIN_3;
-  dth22.type = DHT22;
-  dth22.pullUp = GPIO_NOPULL;
+	InitScheduler();
+	/* USER CODE END 2 */
 
-  HAL_TIM_Base_Start_IT(&htim3);
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+	/* Infinite loop */
+	/* USER CODE BEGIN WHILE */
 	while (1) {
-		dth22Data = DHT_getData(&dth22);
-		TaskTemperatureHumidity();
-    /* USER CODE END WHILE */
+		TaskManager();
 
-    /* USER CODE BEGIN 3 */
+		if (!isPrepared) {
+			UpdateDisplay("Loading...", "");
+			HAL_Delay(500);
+			HAL_TIM_Base_Start_IT(&htim3);
+			isPrepared = 1;
+		}
+		/* USER CODE END WHILE */
+
+		/* USER CODE BEGIN 3 */
 	}
-  /* USER CODE END 3 */
+	/* USER CODE END 3 */
 }
 
 /**
@@ -331,7 +342,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 63999;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 59999;
+  htim3.Init.Period = 59998;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -371,13 +382,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, DTH_Pin|OLED_CS_Pin|OLED_Res_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED1_Pin|DTH_Pin|OLED_CS_Pin|OLED_Res_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : DTH_Pin OLED_CS_Pin */
-  GPIO_InitStruct.Pin = DTH_Pin|OLED_CS_Pin;
+  /*Configure GPIO pins : LED1_Pin DTH_Pin OLED_CS_Pin */
+  GPIO_InitStruct.Pin = LED1_Pin|DTH_Pin|OLED_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
